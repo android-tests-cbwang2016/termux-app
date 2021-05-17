@@ -1,7 +1,6 @@
 package com.termux.terminal;
 
 import android.util.Base64;
-import android.util.Log;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
@@ -109,8 +108,8 @@ public final class TerminalEmulator {
      * characters received when the cursor is at the right border of the page replace characters already on the page."
      */
     private static final int DECSET_BIT_AUTOWRAP = 1 << 3;
-    /** DECSET 25 - if the cursor should be visible, {@link #isShowingCursor()}. */
-    private static final int DECSET_BIT_SHOWING_CURSOR = 1 << 4;
+    /** DECSET 25 - if the cursor should be enabled, {@link #isCursorEnabled()}. */
+    private static final int DECSET_BIT_CURSOR_ENABLED = 1 << 4;
     private static final int DECSET_BIT_APPLICATION_KEYPAD = 1 << 5;
     /** DECSET 1000 - if to report mouse press&release events. */
     private static final int DECSET_BIT_MOUSE_TRACKING_PRESS_RELEASE = 1 << 6;
@@ -152,6 +151,8 @@ public final class TerminalEmulator {
 
     /** The terminal session this emulator is bound to. */
     private final TerminalOutput mSession;
+
+    TerminalSessionClient mClient;
 
     /** Keeps track of the current argument of the current escape sequence. Ranges from 0 to MAX_ESCAPE_PARAMETERS-1. */
     private int mArgIndex;
@@ -205,6 +206,18 @@ public final class TerminalEmulator {
     private boolean mAboutToAutoWrap;
 
     /**
+     * If the cursor blinking is enabled. It requires cursor itself to be enabled, which is controlled
+     * byt whether {@link #DECSET_BIT_CURSOR_ENABLED} bit is set or not.
+     */
+    private boolean mCursorBlinkingEnabled;
+
+    /**
+     * If currently cursor should be in a visible state or not if {@link #mCursorBlinkingEnabled}
+     * is {@code true}.
+     */
+    private boolean mCursorBlinkState;
+
+    /**
      * Current foreground and background colors. Can either be a color index in [0,259] or a truecolor (24-bit) value.
      * For a 24-bit value the top byte (0xff000000) is set.
      *
@@ -226,6 +239,8 @@ public final class TerminalEmulator {
     private int mLastEmittedCodePoint = -1;
 
     public final TerminalColors mColors = new TerminalColors();
+
+    private static final String LOG_TAG = "TerminalEmulator";
 
     private boolean isDecsetInternalBitSet(int bit) {
         return (mCurrentDecSetFlags & bit) != 0;
@@ -258,7 +273,7 @@ public final class TerminalEmulator {
             case 7:
                 return DECSET_BIT_AUTOWRAP;
             case 25:
-                return DECSET_BIT_SHOWING_CURSOR;
+                return DECSET_BIT_CURSOR_ENABLED;
             case 66:
                 return DECSET_BIT_APPLICATION_KEYPAD;
             case 69:
@@ -279,14 +294,19 @@ public final class TerminalEmulator {
         }
     }
 
-    public TerminalEmulator(TerminalOutput session, int columns, int rows, int transcriptRows) {
+    public TerminalEmulator(TerminalOutput session, int columns, int rows, int transcriptRows, TerminalSessionClient client) {
         mSession = session;
         mScreen = mMainBuffer = new TerminalBuffer(columns, transcriptRows, rows);
         mAltBuffer = new TerminalBuffer(columns, rows, rows);
+        mClient = client;
         mRows = rows;
         mColumns = columns;
         mTabStop = new boolean[mColumns];
         reset();
+    }
+
+    public void updateTerminalSessionClient(TerminalSessionClient client) {
+        mClient = client;
     }
 
     public TerminalBuffer getScreen() {
@@ -373,9 +393,27 @@ public final class TerminalEmulator {
         return isDecsetInternalBitSet(DECSET_BIT_REVERSE_VIDEO);
     }
 
-    public boolean isShowingCursor() {
-        return isDecsetInternalBitSet(DECSET_BIT_SHOWING_CURSOR);
+
+
+    public boolean isCursorEnabled() {
+        return isDecsetInternalBitSet(DECSET_BIT_CURSOR_ENABLED);
     }
+    public boolean shouldCursorBeVisible() {
+        if (!isCursorEnabled())
+            return false;
+        else
+            return mCursorBlinkingEnabled ? mCursorBlinkState : true;
+    }
+
+    public void setCursorBlinkingEnabled(boolean cursorBlinkingEnabled) {
+        this.mCursorBlinkingEnabled = cursorBlinkingEnabled;
+    }
+
+    public void setCursorBlinkState(boolean cursorBlinkState) {
+        this.mCursorBlinkState = cursorBlinkState;
+    }
+
+
 
     public boolean isKeypadApplicationMode() {
         return isDecsetInternalBitSet(DECSET_BIT_APPLICATION_KEYPAD);
@@ -751,7 +789,7 @@ public final class TerminalEmulator {
                                 if (internalBit != -1) {
                                     value = isDecsetInternalBitSet(internalBit) ? 1 : 2; // 1=set, 2=reset.
                                 } else {
-                                    Log.e(EmulatorDebug.LOG_TAG, "Got DECRQM for unrecognized private DEC mode=" + mode);
+                                    mClient.logError(LOG_TAG, "Got DECRQM for unrecognized private DEC mode=" + mode);
                                     value = 0; // 0=not recognized, 3=permanently set, 4=permanently reset
                                 }
                             }
@@ -888,7 +926,7 @@ public final class TerminalEmulator {
                                     case "&8": // Undo key - ignore.
                                         break;
                                     default:
-                                        Log.w(EmulatorDebug.LOG_TAG, "Unhandled termcap/terminfo name: '" + trans + "'");
+                                        mClient.logWarn(LOG_TAG, "Unhandled termcap/terminfo name: '" + trans + "'");
                                 }
                                 // Respond with invalid request:
                                 mSession.write("\033P0+r" + part + "\033\\");
@@ -900,12 +938,12 @@ public final class TerminalEmulator {
                                 mSession.write("\033P1+r" + part + "=" + hexEncoded + "\033\\");
                             }
                         } else {
-                            Log.e(EmulatorDebug.LOG_TAG, "Invalid device termcap/terminfo name of odd length: " + part);
+                            mClient.logError(LOG_TAG, "Invalid device termcap/terminfo name of odd length: " + part);
                         }
                     }
                 } else {
                     if (LOG_ESCAPE_SEQUENCES)
-                        Log.e(EmulatorDebug.LOG_TAG, "Unrecognized device control string: " + dcs);
+                        mClient.logError(LOG_TAG, "Unrecognized device control string: " + dcs);
                 }
                 finishSequence();
             }
@@ -995,7 +1033,7 @@ public final class TerminalEmulator {
                     int externalBit = mArgs[i];
                     int internalBit = mapDecSetBitToInternalBit(externalBit);
                     if (internalBit == -1) {
-                        Log.w(EmulatorDebug.LOG_TAG, "Ignoring request to save/recall decset bit=" + externalBit);
+                        mClient.logWarn(LOG_TAG, "Ignoring request to save/recall decset bit=" + externalBit);
                     } else {
                         if (b == 's') {
                             mSavedDecSetFlags |= internalBit;
@@ -1046,7 +1084,10 @@ public final class TerminalEmulator {
             case 8: // Auto-repeat Keys (DECARM). Do not implement.
             case 9: // X10 mouse reporting - outdated. Do not implement.
             case 12: // Control cursor blinking - ignore.
-            case 25: // Hide/show cursor - no action needed, renderer will check with isShowingCursor().
+            case 25: // Hide/show cursor - no action needed, renderer will check with shouldCursorBeVisible().
+                if (mClient != null)
+                    mClient.onTerminalCursorStateChange(setting);
+                break;
             case 40: // Allow 80 => 132 Mode, ignore.
             case 45: // TODO: Reverse wrap-around. Implement???
             case 66: // Application keypad (DECNKM).
@@ -1182,7 +1223,7 @@ public final class TerminalEmulator {
                 // (1) enables this feature for keys except for those with well-known behavior, e.g., Tab, Backarrow and
                 // some special control character cases, e.g., Control-Space to make a NUL.
                 // (2) enables this feature for keys including the exceptions listed.
-                Log.e(EmulatorDebug.LOG_TAG, "(ignored) CSI > MODIFY RESOURCE: " + getArg0(-1) + " to " + getArg1(-1));
+                mClient.logError(LOG_TAG, "(ignored) CSI > MODIFY RESOURCE: " + getArg0(-1) + " to " + getArg1(-1));
                 break;
             default:
                 parseArg(b);
@@ -1729,7 +1770,7 @@ public final class TerminalEmulator {
                 int firstArg = mArgs[i + 1];
                 if (firstArg == 2) {
                     if (i + 4 > mArgIndex) {
-                        Log.w(EmulatorDebug.LOG_TAG, "Too few CSI" + code + ";2 RGB arguments");
+                        mClient.logWarn(LOG_TAG, "Too few CSI" + code + ";2 RGB arguments");
                     } else {
                         int red = mArgs[i + 2], green = mArgs[i + 3], blue = mArgs[i + 4];
                         if (red < 0 || green < 0 || blue < 0 || red > 255 || green > 255 || blue > 255) {
@@ -1754,7 +1795,7 @@ public final class TerminalEmulator {
                             mBackColor = color;
                         }
                     } else {
-                        if (LOG_ESCAPE_SEQUENCES) Log.w(EmulatorDebug.LOG_TAG, "Invalid color index: " + color);
+                        if (LOG_ESCAPE_SEQUENCES) mClient.logWarn(LOG_TAG, "Invalid color index: " + color);
                     }
                 } else {
                     finishSequenceAndLogError("Invalid ISO-8613-3 SGR first argument: " + firstArg);
@@ -1771,7 +1812,7 @@ public final class TerminalEmulator {
                 mBackColor = code - 100 + 8;
             } else {
                 if (LOG_ESCAPE_SEQUENCES)
-                    Log.w(EmulatorDebug.LOG_TAG, String.format("SGR unknown code %d", code));
+                    mClient.logWarn(LOG_TAG, String.format("SGR unknown code %d", code));
             }
         }
     }
@@ -1905,7 +1946,7 @@ public final class TerminalEmulator {
                     String clipboardText = new String(Base64.decode(textParameter.substring(startIndex), 0), StandardCharsets.UTF_8);
                     mSession.clipboardText(clipboardText);
                 } catch (Exception e) {
-                    Log.e(EmulatorDebug.LOG_TAG, "OSC Manipulate selection, invalid string '" + textParameter + "");
+                    mClient.logError(LOG_TAG, "OSC Manipulate selection, invalid string '" + textParameter + "");
                 }
                 break;
             case 104:
@@ -2101,7 +2142,7 @@ public final class TerminalEmulator {
     }
 
     private void finishSequenceAndLogError(String error) {
-        if (LOG_ESCAPE_SEQUENCES) Log.w(EmulatorDebug.LOG_TAG, error);
+        if (LOG_ESCAPE_SEQUENCES) mClient.logWarn(LOG_TAG, error);
         finishSequence();
     }
 
@@ -2310,7 +2351,7 @@ public final class TerminalEmulator {
         mCurrentDecSetFlags = 0;
         // Initial wrap-around is not accurate but makes terminal more useful, especially on a small screen:
         setDecsetinternalBit(DECSET_BIT_AUTOWRAP, true);
-        setDecsetinternalBit(DECSET_BIT_SHOWING_CURSOR, true);
+        setDecsetinternalBit(DECSET_BIT_CURSOR_ENABLED, true);
         mSavedDecSetFlags = mSavedStateMain.mSavedDecFlags = mSavedStateAlt.mSavedDecFlags = mCurrentDecSetFlags;
 
         // XXX: Should we set terminal driver back to IUTF8 with termios?
